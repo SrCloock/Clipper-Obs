@@ -1,0 +1,24 @@
+{
+  "version": "1.0.0",
+  "obs": {
+    "host": "localhost",
+    "port": 4455,
+    "password": "",
+    "reconnect_interval": 5
+  },
+  "hotkey": {
+    "key_combination": "ctrl+shift+c",
+    "enabled": true
+  },
+  "clip": {
+    "delay_seconds": 5.0,
+    "output_path": "",
+    "naming_template": "{date}_{time}_{counter}",
+    "max_queue_size": 10
+  },
+  "audio": {
+    "enabled": true,
+    "volume": 0.7,
+    "sound_path": ""
+  }
+}

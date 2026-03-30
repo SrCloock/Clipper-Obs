@@ -1,0 +1,24 @@
+PyQt6
+obsws-python==1.6.0
+keyboard==0.13.5
+pygame
+python-dateutil==2.8.2
+
+
+# Dependencias principales
+PyQt6>=6.5.0
+obsws-python>=1.5.0
+keyboard>=0.13.5
+pygame>=2.5.0
+watchdog>=3.0.0
+Pillow>=10.0.0
+
+# Dependencias de desarrollo (opcionales)
+pyinstaller>=5.13.0  # Para crear ejecutables
+
+
+PyQt6>=6.0.0
+obsws-python>=1.4.0
+pynput>=1.7.0
+pygame>=2.0.0
+pillow>=8.0.0
