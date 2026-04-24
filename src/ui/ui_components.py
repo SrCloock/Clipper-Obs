@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QUrl
 from PyQt6.QtGui import QKeySequence, QDesktopServices
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from src.utils.validators import Validators
 
@@ -347,31 +347,47 @@ Si dos clips generan el mismo nombre, se añadirá automáticamente _1, _2, etc.
 
 
 class ClipConfigTab(QWidget):
-    """Pestaña de configuración de los clips con plantilla personalizable y timeout."""
+    """
+    Pestaña de configuración de los clips.
+    Ahora el 'delay' representa la duración hacia atrás (replay) y hacia adelante (grabación).
+    Muestra el límite máximo permitido según el replay buffer de OBS.
+    """
 
     config_changed = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
+        self.max_delay_limit: Optional[int] = None  # Se establecerá desde el controlador
         self.setup_ui()
         self.connect_signals()
 
     def setup_ui(self):
         layout = QFormLayout()
 
-        # Delay
+        # Duración del clip (antes delay)
         self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(0.0, 3600.0)
+        self.delay_spin.setRange(1.0, 3600.0)  # Se ajustará luego con el límite real
         self.delay_spin.setSuffix(" seg")
         self.delay_spin.setValue(5.0)
-        layout.addRow("Delay:", self.delay_spin)
+        self.delay_spin.setToolTip(
+            "Tiempo hacia atrás (usando replay buffer) y hacia adelante (grabación normal).\n"
+            "El clip final tendrá una duración total de 2x este valor."
+        )
+        layout.addRow("Duración del clip:", self.delay_spin)
 
-        # Timeout de archivo (nuevo)
+        # Etiqueta para mostrar el límite máximo
+        self.max_limit_label = QLabel("Máximo: consultando OBS...")
+        self.max_limit_label.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        layout.addRow("", self.max_limit_label)
+
+        # Timeout de archivo
         self.file_timeout_spin = QDoubleSpinBox()
         self.file_timeout_spin.setRange(5.0, 60.0)
         self.file_timeout_spin.setSuffix(" seg")
         self.file_timeout_spin.setValue(15.0)
-        self.file_timeout_spin.setToolTip("Tiempo máximo para esperar que el archivo del clip esté listo después de guardarlo")
+        self.file_timeout_spin.setToolTip(
+            "Tiempo máximo para esperar que el archivo del clip esté listo después de guardarlo"
+        )
         layout.addRow("Timeout de archivo:", self.file_timeout_spin)
 
         # Carpeta de salida
@@ -412,13 +428,33 @@ class ClipConfigTab(QWidget):
         self.help_button.clicked.connect(self._show_help)
         self.queue_spin.valueChanged.connect(self._on_change)
 
+    def set_max_delay_limit(self, limit_seconds: Optional[int]):
+        """
+        Establece el límite máximo de delay (duración) basado en el replay buffer de OBS.
+        Se llama desde el controlador cuando se conecta a OBS.
+        """
+        self.max_delay_limit = limit_seconds
+        if limit_seconds is not None:
+            self.delay_spin.setMaximum(limit_seconds)
+            self.max_limit_label.setText(f"Máximo: {limit_seconds} seg (replay buffer de OBS)")
+            # Si el valor actual excede el límite, ajustarlo
+            if self.delay_spin.value() > limit_seconds:
+                self.delay_spin.setValue(limit_seconds)
+        else:
+            self.delay_spin.setMaximum(3600.0)
+            self.max_limit_label.setText("Máximo: no disponible (conecta a OBS)")
+
     def _validate(self) -> tuple[bool, str]:
         """Valida todos los campos."""
-        # Validar delay
+        # Validar duración
         delay = self.delay_spin.value()
         valid, error = Validators.validate_delay(delay)
         if not valid:
             return False, error
+
+        # Validar contra límite de OBS si está disponible
+        if self.max_delay_limit is not None and delay > self.max_delay_limit:
+            return False, f"La duración no puede exceder el replay buffer de OBS ({self.max_delay_limit}s)"
 
         # Validar ruta de salida
         path = self.path_edit.text().strip()
@@ -437,11 +473,13 @@ class ClipConfigTab(QWidget):
     def _on_change(self):
         valid, error = self._validate()
         if not valid:
-            # Marcar el campo correspondiente (opcional)
-            if "delay" in error.lower():
+            # Marcar campo correspondiente
+            if "duración" in error.lower() or "replay buffer" in error.lower():
                 self.delay_spin.setStyleSheet("border: 1px solid #ef4444;")
+                self.delay_spin.setToolTip(error)
             else:
                 self.delay_spin.setStyleSheet("")
+                self.delay_spin.setToolTip("")
             if "ruta" in error.lower():
                 self.path_edit.setStyleSheet("border: 1px solid #ef4444;")
             else:
@@ -450,14 +488,12 @@ class ClipConfigTab(QWidget):
                 self.template_edit.setStyleSheet("border: 1px solid #ef4444;")
             else:
                 self.template_edit.setStyleSheet("")
-            # Mostrar tooltip (podría ser un label, pero simplificamos)
-            self.setToolTip(error)
             return
         else:
             self.delay_spin.setStyleSheet("")
+            self.delay_spin.setToolTip("")
             self.path_edit.setStyleSheet("")
             self.template_edit.setStyleSheet("")
-            self.setToolTip("")
 
         self.config_changed.emit(self.get_config_data())
 

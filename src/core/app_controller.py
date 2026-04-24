@@ -1,5 +1,6 @@
 """
 Controlador principal de la aplicación - VERSIÓN FINAL CON MEJORAS
+Soporta grabación hacia adelante y límite de duración basado en replay buffer.
 """
 
 import logging
@@ -121,6 +122,8 @@ class ConnectionManager:
                         if success:
                             logger.info("✅ Reconexión exitosa")
                             self._consecutive_failures = 0
+                            # Al reconectar, actualizar límite de delay en UI
+                            self.controller._update_delay_limit_from_obs()
                         else:
                             logger.error("❌ No se pudo reconectar después de varios intentos")
                             self._consecutive_failures += 1
@@ -223,6 +226,9 @@ class ConfigHandler:
                     max_queue_size=max_queue,
                     file_timeout=file_timeout
                 )
+                # Si se cambió el delay, verificar límite y actualizar UI
+                if delay is not None and self.controller.ui:
+                    self.controller._update_delay_limit_ui()
 
     def _apply_file_changes(self, new_config):
         """Actualizar gestor de archivos con nueva ruta de salida o plantilla."""
@@ -385,6 +391,8 @@ class ApplicationController(QObject):
 
         if self.obs_manager and self.obs_manager.is_connected():
             self.on_obs_status_changed(self.obs_manager.get_status())
+            # Obtener límite de delay y actualizar UI
+            self._update_delay_limit_from_obs()
         else:
             self.set_state(AppState.DISCONNECTED)
 
@@ -403,6 +411,37 @@ class ApplicationController(QObject):
             except Exception as e:
                 self.ulog.error("ApplicationController", "_register_initial_hotkey",
                                 f"Error registrando hotkey inicial: {e}")
+
+    def _update_delay_limit_from_obs(self):
+        """
+        Obtiene la duración del replay buffer de OBS y actualiza el límite en la UI
+        y en el orquestador.
+        """
+        if not self.obs_manager or not self.obs_manager.is_connected():
+            return
+
+        limit = self.obs_manager.get_replay_buffer_duration()
+        if limit is not None:
+            # Actualizar orquestador
+            if self.orchestrator:
+                self.orchestrator.max_allowed_delay = limit
+                # Si el delay actual es mayor, se ajusta en el orquestador
+                if self.config.clip.delay_seconds > limit:
+                    self.ulog.warning("ApplicationController", "_update_delay_limit_from_obs",
+                                      f"Delay configurado ({self.config.clip.delay_seconds}s) > límite ({limit}s). Ajustando...")
+                    self.config.clip.delay_seconds = limit
+                    self.config_manager.save()
+                    if self.ui:
+                        self.ui.clip_tab.delay_spin.setValue(limit)
+            # Actualizar UI
+            self._update_delay_limit_ui(limit)
+
+    def _update_delay_limit_ui(self, limit: Optional[int] = None):
+        """Actualiza el límite máximo en la pestaña de configuración de clips."""
+        if self.ui and hasattr(self.ui, 'clip_tab'):
+            if limit is None and self.obs_manager and self.obs_manager.is_connected():
+                limit = self.obs_manager.get_replay_buffer_duration()
+            self.ui.clip_tab.set_max_delay_limit(limit)
 
     def set_state(self, new_state: AppState):
         if self.shutting_down:
@@ -475,6 +514,8 @@ class ApplicationController(QObject):
 
         if status.state.name == 'CONNECTED':
             self.set_state(AppState.CONNECTED)
+            # Al conectar, actualizar límite de delay
+            self._update_delay_limit_from_obs()
         elif status.state.name in ['DISCONNECTED', 'ERROR']:
             self.set_state(AppState.DISCONNECTED)
 
@@ -499,6 +540,7 @@ class ApplicationController(QObject):
             success = self.obs_manager.connect()
             if success:
                 self.ulog.info("ApplicationController", "_reconnect_obs", "Reconexión exitosa")
+                self._update_delay_limit_from_obs()
             else:
                 self.ulog.error("ApplicationController", "_reconnect_obs", "Reconexión fallida")
         except Exception as e:

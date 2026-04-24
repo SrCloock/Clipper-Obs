@@ -14,7 +14,6 @@ class Validators:
     """Clase de validación de datos"""
 
     # Conjunto de teclas soportadas por pynput (para validación de hotkey)
-    # Esto es una lista ampliada; se puede usar para validar la combinación
     VALID_KEYS = {
         # Modificadores
         'ctrl', 'control', 'shift', 'alt', 'win', 'cmd',

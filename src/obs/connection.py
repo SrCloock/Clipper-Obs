@@ -1,14 +1,16 @@
 """
-Gestor de conexión OBS WebSocket - VERSIÓN CORREGIDA
-- Eliminado método duplicado get_last_replay_path
-- wait_for_file mejorado con timeout configurable
-- Logs más detallados
+Gestor de conexión OBS WebSocket - VERSIÓN MEJORADA PARA GRABACIÓN HACIA ADELANTE
+- Obtiene duración del Replay Buffer para limitar delay
+- Soporte para iniciar/detener grabación normal
+- Método para obtener ruta del último archivo grabado
 """
 
 import threading
 import time
 import logging
-from typing import Optional, Callable
+import os
+from pathlib import Path
+from typing import Optional, Callable, List
 from dataclasses import dataclass
 from enum import Enum
 
@@ -181,6 +183,158 @@ class OBSConnectionManager:
     def get_status(self) -> OBSConnectionStatus:
         return self.status
 
+    # -------------------------------------------------------------------------
+    # NUEVOS MÉTODOS PARA GRABACIÓN HACIA ADELANTE
+    # -------------------------------------------------------------------------
+
+    def get_replay_buffer_duration(self) -> Optional[int]:
+        """
+        Obtiene la duración configurada del Replay Buffer en OBS (en segundos).
+        Retorna None si no se puede obtener.
+        """
+        if not self.is_connected():
+            self.ulog.error("OBS", "get_replay_buffer_duration", "No conectado")
+            return None
+
+        try:
+            # En obs-websocket 5.x, se usa GetProfileParameter
+            response = self.client.get_profile_parameter(
+                parameterCategory="Output",
+                parameterName="ReplayBufferSeconds"
+            )
+            # El valor viene como string, lo convertimos a entero
+            duration = int(response.parameter_value)
+            self.ulog.info("OBS", "get_replay_buffer_duration",
+                           f"Duración del Replay Buffer: {duration} segundos")
+            return duration
+        except Exception as e:
+            self.ulog.error("OBS", "get_replay_buffer_duration",
+                            f"No se pudo obtener la duración: {e}")
+            return None
+
+    def start_record(self) -> bool:
+        """Inicia la grabación normal en OBS."""
+        if not self.is_connected():
+            self.ulog.error("OBS", "start_record", "No conectado")
+            return False
+        try:
+            self.client.start_record()
+            self.status.is_recording = True
+            self.ulog.info("OBS", "start_record", "Grabación iniciada")
+            return True
+        except Exception as e:
+            self.ulog.error("OBS", "start_record", f"Error al iniciar grabación: {e}")
+            return False
+
+    def stop_record(self) -> bool:
+        """Detiene la grabación normal en OBS."""
+        if not self.is_connected():
+            self.ulog.error("OBS", "stop_record", "No conectado")
+            return False
+        try:
+            self.client.stop_record()
+            self.status.is_recording = False
+            self.ulog.info("OBS", "stop_record", "Grabación detenida")
+            return True
+        except Exception as e:
+            self.ulog.error("OBS", "stop_record", f"Error al detener grabación: {e}")
+            return False
+
+    def get_record_directory(self) -> Optional[str]:
+        """Obtiene el directorio donde OBS guarda las grabaciones."""
+        if not self.is_connected():
+            return None
+        try:
+            resp = self.client.get_record_directory()
+            return resp.record_directory
+        except Exception as e:
+            self.ulog.error("OBS", "get_record_directory", f"Error: {e}")
+            return None
+
+    def get_last_record_path(self, timeout: float = 10.0) -> Optional[str]:
+        """
+        Intenta obtener la ruta del último archivo de grabación generado.
+        Como OBS no expone directamente la ruta, se usa una estrategia basada en
+        el directorio de grabación y el archivo más reciente después de detener la grabación.
+
+        Args:
+            timeout: Tiempo máximo de espera para que aparezca el archivo (segundos).
+
+        Returns:
+            Ruta completa del archivo o None si no se encuentra.
+        """
+        record_dir = self.get_record_directory()
+        if not record_dir:
+            self.ulog.error("OBS", "get_last_record_path", "No se pudo obtener directorio de grabación")
+            return None
+
+        record_path = Path(record_dir)
+        if not record_path.exists():
+            self.ulog.error("OBS", "get_last_record_path", f"Directorio no existe: {record_dir}")
+            return None
+
+        # Obtener lista de archivos antes de la grabación (si estamos en medio de una)
+        # Pero como llamamos a este método justo después de stop_record, podemos
+        # tomar el archivo más reciente que haya aparecido en los últimos segundos.
+
+        self.ulog.info("OBS", "get_last_record_path", f"Buscando archivo más reciente en {record_dir}")
+
+        start_time = time.time()
+        last_check = set()
+        # Primero, registrar archivos existentes para ignorarlos
+        try:
+            for f in record_path.iterdir():
+                if f.is_file():
+                    last_check.add(f)
+        except Exception:
+            pass
+
+        while time.time() - start_time < timeout:
+            try:
+                newest_file = None
+                newest_mtime = 0
+                for f in record_path.iterdir():
+                    if f.is_file() and f not in last_check:
+                        mtime = f.stat().st_mtime
+                        if mtime > newest_mtime:
+                            newest_mtime = mtime
+                            newest_file = f
+
+                if newest_file:
+                    # Verificar que el archivo no esté siendo escrito aún
+                    if self._wait_for_file_ready(str(newest_file), timeout=5.0):
+                        self.ulog.info("OBS", "get_last_record_path", f"Archivo encontrado: {newest_file}")
+                        return str(newest_file)
+            except Exception as e:
+                self.ulog.debug("OBS", "get_last_record_path", f"Esperando archivo: {e}")
+
+            time.sleep(0.5)
+
+        self.ulog.warning("OBS", "get_last_record_path", "Timeout buscando archivo de grabación")
+        return None
+
+    def _wait_for_file_ready(self, filepath: str, timeout: float = 10.0) -> bool:
+        """Espera a que un archivo deje de crecer (escritura finalizada)."""
+        path = Path(filepath)
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                if not path.exists():
+                    time.sleep(0.1)
+                    continue
+                size1 = path.stat().st_size
+                time.sleep(0.2)
+                size2 = path.stat().st_size
+                if size1 == size2 and size1 > 0:
+                    return True
+            except Exception:
+                time.sleep(0.1)
+        return False
+
+    # -------------------------------------------------------------------------
+    # MÉTODOS EXISTENTES (REPLAY BUFFER)
+    # -------------------------------------------------------------------------
+
     def save_replay_buffer(self) -> bool:
         if not self.is_connected():
             self.ulog.error("OBS", "save_replay", "No conectado")
@@ -196,13 +350,6 @@ class OBSConnectionManager:
     def get_last_replay_path(self, wait: bool = True, timeout: float = 5.0) -> Optional[str]:
         """
         Obtener la ruta del último clip guardado del replay buffer.
-
-        Args:
-            wait: Si es True, espera hasta que la ruta esté disponible (reintentos).
-            timeout: Tiempo máximo de espera en segundos (solo si wait=True).
-
-        Returns:
-            Ruta del archivo o None si no se pudo obtener.
         """
         if not self.is_connected():
             self.ulog.error("OBS", "get_last_replay_path", "No conectado")
@@ -213,17 +360,14 @@ class OBSConnectionManager:
 
         while True:
             try:
-                # Método específico de OBS WebSocket v5
                 response = self.client.get_last_replay_buffer_replay()
                 if hasattr(response, 'saved_replay_path') and response.saved_replay_path:
                     path = response.saved_replay_path
                     self.ulog.info("OBS", "get_last_replay_path", f"Ruta obtenida: {path}")
                     return path
                 else:
-                    # La respuesta no contiene la ruta
                     last_error = "Respuesta sin ruta"
             except AttributeError:
-                # El método no está disponible en esta versión
                 last_error = "Método get_last_replay_buffer_replay no disponible"
                 self.ulog.warning("OBS", "get_last_replay_path", last_error)
                 break
@@ -234,7 +378,7 @@ class OBSConnectionManager:
             if not wait or (time.time() - start_time) > timeout:
                 break
 
-            time.sleep(0.2)  # esperar un poco antes de reintentar
+            time.sleep(0.2)
 
         self.ulog.error("OBS", "get_last_replay_path",
                         f"No se pudo obtener la ruta: {last_error}")
@@ -243,26 +387,18 @@ class OBSConnectionManager:
     def wait_for_file(self, timeout: float = 15.0) -> Optional[str]:
         """
         Espera a que el archivo del último clip esté completamente escrito y accesible.
-
-        Args:
-            timeout: Tiempo máximo de espera en segundos (por defecto 15s).
-
-        Returns:
-            Ruta del archivo si está listo, None en caso contrario.
         """
         path = self.get_last_replay_path(wait=True, timeout=timeout)
         if not path:
             self.ulog.warning("OBS", "wait_for_file", "No se pudo obtener la ruta del archivo")
             return None
 
-        import os
         start_time = time.time()
         self.ulog.info("OBS", "wait_for_file", f"Esperando que el archivo esté listo: {path}")
 
         while time.time() - start_time < timeout:
             try:
                 if os.path.exists(path) and os.path.getsize(path) > 0:
-                    # Verificar que el tamaño no cambie durante un breve lapso
                     size1 = os.path.getsize(path)
                     time.sleep(0.1)
                     size2 = os.path.getsize(path)
