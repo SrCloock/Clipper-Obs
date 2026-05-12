@@ -1,5 +1,7 @@
 """
 Componentes UI reutilizables para la ventana principal de OBS Clip Manager.
+Pestañas: OBS, Hotkey, Clips, Audio, Clips recientes.
+Panel de estado con barra de progreso.
 """
 
 from PyQt6.QtWidgets import (
@@ -7,7 +9,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLineEdit, QSpinBox, QDoubleSpinBox,
     QCheckBox, QSlider, QFormLayout, QFileDialog, QKeySequenceEdit,
     QMessageBox, QListWidget, QListWidgetItem, QApplication, QDialog,
-    QDialogButtonBox, QTextEdit
+    QDialogButtonBox, QTextEdit, QProgressBar
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl
 from PyQt6.QtGui import QKeySequence, QDesktopServices
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class StatusFrame(QGroupBox):
-    """Panel de estado de la aplicación y OBS."""
+    """Panel de estado de la aplicación y OBS con barra de progreso."""
 
     def __init__(self):
         super().__init__("Estado")
@@ -51,6 +53,33 @@ class StatusFrame(QGroupBox):
 
         layout.addLayout(status_row)
 
+        # Barra de progreso para clips
+        progress_layout = QVBoxLayout()
+        self.progress_label = QLabel("Listo")
+        self.progress_label.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        progress_layout.addWidget(self.progress_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #45475a;
+                border-radius: 4px;
+                background-color: #313244;
+                text-align: center;
+                color: #cdd6f4;
+            }
+            QProgressBar::chunk {
+                background-color: #89b4fa;
+                border-radius: 3px;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
+
         # Cola de clips
         queue_row = QHBoxLayout()
         queue_row.addWidget(QLabel("Clips en cola:"))
@@ -73,12 +102,7 @@ class StatusFrame(QGroupBox):
             self.app_state_label.setStyleSheet("color: #eab308; font-weight: bold;")
 
     def update_obs_status(self, status: dict):
-        """
-        Actualiza los indicadores de OBS.
-
-        Args:
-            status: Diccionario con claves 'connected', 'is_streaming', 'replay_active'.
-        """
+        """Actualiza los indicadores de OBS."""
         connected = status.get('connected', False)
         streaming = status.get('is_streaming', False)
         replay = status.get('replay_active', False)
@@ -108,6 +132,20 @@ class StatusFrame(QGroupBox):
         """Actualiza el tamaño de la cola de clips."""
         self.queue_size_label.setText(str(queue_size))
 
+    def update_clip_progress(self, message: str, percent: int):
+        """Actualiza la barra de progreso y el mensaje del clip actual."""
+        self.progress_label.setText(message)
+        self.progress_bar.setValue(percent)
+        # Resetear cuando alcanza el 100% después de un pequeño retardo
+        if percent >= 100:
+            # Programar reinicio después de 2 segundos (se puede hacer desde el controlador)
+            pass
+
+    def reset_progress(self):
+        """Resetea la barra de progreso a 0."""
+        self.progress_label.setText("Listo")
+        self.progress_bar.setValue(0)
+
 
 class OBSConfigTab(QWidget):
     """Pestaña de configuración de conexión OBS."""
@@ -118,7 +156,7 @@ class OBSConfigTab(QWidget):
         super().__init__()
         self.setup_ui()
         self.connect_signals()
-        self._current_values = {}  # Almacenar valores para revertir si falla validación
+        self._current_values = {}
 
     def setup_ui(self):
         layout = QFormLayout()
@@ -152,24 +190,19 @@ class OBSConfigTab(QWidget):
         self.reconnect_spin.valueChanged.connect(self._on_change)
 
     def _validate(self) -> tuple[bool, str]:
-        """Valida los datos actuales del formulario."""
         host = self.host_edit.text().strip()
         port = self.port_spin.value()
         password = self.password_edit.text()
-
         is_valid, error = Validators.validate_obs_credentials(host, port, password)
         if not is_valid:
             return False, error
         return True, ""
 
     def _on_change(self):
-        # Validar antes de emitir
         valid, error = self._validate()
         if not valid:
-            # Mostrar tooltip temporal en el campo correspondiente
             self.host_edit.setToolTip(error)
             self.host_edit.setStyleSheet("border: 1px solid #ef4444;")
-            # No emitir señal si es inválido
             return
         else:
             self.host_edit.setToolTip("")
@@ -211,13 +244,11 @@ class HotkeyConfigTab(QWidget):
         hotkey_group = QGroupBox("Combinación de teclas")
         h_layout = QHBoxLayout()
 
-        # Campo de texto que muestra la combinación actual (solo lectura)
         self.hotkey_display = QLineEdit()
         self.hotkey_display.setReadOnly(True)
         self.hotkey_display.setPlaceholderText("No configurada")
         h_layout.addWidget(self.hotkey_display)
 
-        # Botón para grabar nueva combinación
         self.record_button = QPushButton("Grabar hotkey")
         self.record_button.setToolTip("Haz clic y luego presiona la combinación de teclas deseada")
         h_layout.addWidget(self.record_button)
@@ -233,35 +264,29 @@ class HotkeyConfigTab(QWidget):
         self.record_button.clicked.connect(self._record_hotkey)
 
     def _record_hotkey(self):
-        """Abre un diálogo modal para capturar una combinación de teclas."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Grabar hotkey")
         dialog.setModal(True)
-
         layout = QVBoxLayout(dialog)
 
         label = QLabel("Presiona la combinación de teclas que deseas usar...\n(Presiona la combinación, luego haz clic en Aceptar)")
         label.setWordWrap(True)
         layout.addWidget(label)
 
-        # QKeySequenceEdit temporal
         key_edit = QKeySequenceEdit()
         key_edit.setKeySequence(QKeySequence(self.hotkey_display.text()))
         layout.addWidget(key_edit)
 
-        # Botones
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
 
-        # Enfoque inicial en el editor de teclas
         key_edit.setFocus()
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
             seq = key_edit.keySequence().toString(QKeySequence.SequenceFormat.NativeText)
             if seq:
-                # Validar la combinación
                 is_valid, error = Validators.validate_hotkey(seq.lower())
                 if is_valid:
                     self.hotkey_display.setText(seq)
@@ -272,9 +297,8 @@ class HotkeyConfigTab(QWidget):
                 QMessageBox.warning(self, "Hotkey inválida", "No se ha especificado ninguna combinación")
 
     def _validate(self) -> tuple[bool, str]:
-        """Valida la combinación de teclas."""
         if not self.enable_check.isChecked():
-            return True, ""  # No es necesario validar si está deshabilitado
+            return True, ""
         seq = self.hotkey_display.text().strip()
         if not seq:
             return False, "No se ha especificado ninguna combinación"
@@ -286,7 +310,6 @@ class HotkeyConfigTab(QWidget):
         if not valid:
             self.hotkey_display.setToolTip(error)
             self.hotkey_display.setStyleSheet("border: 1px solid #ef4444;")
-            # No emitir
             return
         else:
             self.hotkey_display.setToolTip("")
@@ -349,24 +372,22 @@ Si dos clips generan el mismo nombre, se añadirá automáticamente _1, _2, etc.
 class ClipConfigTab(QWidget):
     """
     Pestaña de configuración de los clips.
-    Ahora el 'delay' representa la duración hacia atrás (replay) y hacia adelante (grabación).
-    Muestra el límite máximo permitido según el replay buffer de OBS.
+    Muestra límite máximo según el replay buffer de OBS.
     """
 
     config_changed = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
-        self.max_delay_limit: Optional[int] = None  # Se establecerá desde el controlador
+        self.max_delay_limit: Optional[int] = None
         self.setup_ui()
         self.connect_signals()
 
     def setup_ui(self):
         layout = QFormLayout()
 
-        # Duración del clip (antes delay)
         self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(1.0, 3600.0)  # Se ajustará luego con el límite real
+        self.delay_spin.setRange(1.0, 3600.0)
         self.delay_spin.setSuffix(" seg")
         self.delay_spin.setValue(5.0)
         self.delay_spin.setToolTip(
@@ -375,12 +396,10 @@ class ClipConfigTab(QWidget):
         )
         layout.addRow("Duración del clip:", self.delay_spin)
 
-        # Etiqueta para mostrar el límite máximo
         self.max_limit_label = QLabel("Máximo: consultando OBS...")
         self.max_limit_label.setStyleSheet("color: #a6adc8; font-size: 10px;")
         layout.addRow("", self.max_limit_label)
 
-        # Timeout de archivo
         self.file_timeout_spin = QDoubleSpinBox()
         self.file_timeout_spin.setRange(5.0, 60.0)
         self.file_timeout_spin.setSuffix(" seg")
@@ -390,7 +409,6 @@ class ClipConfigTab(QWidget):
         )
         layout.addRow("Timeout de archivo:", self.file_timeout_spin)
 
-        # Carpeta de salida
         path_layout = QHBoxLayout()
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText(str(Path.home() / "Videos" / "OBS Clips"))
@@ -399,7 +417,6 @@ class ClipConfigTab(QWidget):
         path_layout.addWidget(self.browse_button)
         layout.addRow("Carpeta de salida:", path_layout)
 
-        # Plantilla de nombres con botón de ayuda
         template_layout = QHBoxLayout()
         self.template_edit = QLineEdit()
         self.template_edit.setPlaceholderText("{date}_{time}_{counter}")
@@ -410,7 +427,6 @@ class ClipConfigTab(QWidget):
         template_layout.addWidget(self.help_button)
         layout.addRow("Plantilla:", template_layout)
 
-        # Tamaño de cola
         self.queue_spin = QSpinBox()
         self.queue_spin.setRange(1, 100)
         self.queue_spin.setSuffix(" clips")
@@ -429,15 +445,10 @@ class ClipConfigTab(QWidget):
         self.queue_spin.valueChanged.connect(self._on_change)
 
     def set_max_delay_limit(self, limit_seconds: Optional[int]):
-        """
-        Establece el límite máximo de delay (duración) basado en el replay buffer de OBS.
-        Se llama desde el controlador cuando se conecta a OBS.
-        """
         self.max_delay_limit = limit_seconds
         if limit_seconds is not None:
             self.delay_spin.setMaximum(limit_seconds)
             self.max_limit_label.setText(f"Máximo: {limit_seconds} seg (replay buffer de OBS)")
-            # Si el valor actual excede el límite, ajustarlo
             if self.delay_spin.value() > limit_seconds:
                 self.delay_spin.setValue(limit_seconds)
         else:
@@ -445,35 +456,25 @@ class ClipConfigTab(QWidget):
             self.max_limit_label.setText("Máximo: no disponible (conecta a OBS)")
 
     def _validate(self) -> tuple[bool, str]:
-        """Valida todos los campos."""
-        # Validar duración
         delay = self.delay_spin.value()
         valid, error = Validators.validate_delay(delay)
         if not valid:
             return False, error
-
-        # Validar contra límite de OBS si está disponible
         if self.max_delay_limit is not None and delay > self.max_delay_limit:
             return False, f"La duración no puede exceder el replay buffer de OBS ({self.max_delay_limit}s)"
-
-        # Validar ruta de salida
         path = self.path_edit.text().strip()
         valid, error = Validators.validate_output_path(path)
         if not valid:
             return False, error
-
-        # Validar plantilla
         template = self.template_edit.text().strip()
         valid, error = Validators.validate_naming_template(template)
         if not valid:
             return False, error
-
         return True, ""
 
     def _on_change(self):
         valid, error = self._validate()
         if not valid:
-            # Marcar campo correspondiente
             if "duración" in error.lower() or "replay buffer" in error.lower():
                 self.delay_spin.setStyleSheet("border: 1px solid #ef4444;")
                 self.delay_spin.setToolTip(error)
@@ -494,7 +495,6 @@ class ClipConfigTab(QWidget):
             self.delay_spin.setToolTip("")
             self.path_edit.setStyleSheet("")
             self.template_edit.setStyleSheet("")
-
         self.config_changed.emit(self.get_config_data())
 
     def _browse_folder(self):
@@ -504,7 +504,6 @@ class ClipConfigTab(QWidget):
             self._on_change()
 
     def _show_help(self):
-        """Muestra el diálogo de ayuda con los tokens."""
         dlg = HelpDialog(self)
         dlg.exec()
 
@@ -567,15 +566,12 @@ class AudioConfigTab(QWidget):
         self.sound_browse_button.clicked.connect(self._browse_sound)
 
     def _validate(self) -> tuple[bool, str]:
-        """Valida volumen (y opcionalmente ruta de archivo si existe)."""
         volume = self.volume_slider.value() / 100.0
         valid, error = Validators.validate_volume(volume)
         if not valid:
             return False, error
-        # Si se especificó un archivo, comprobar que existe (opcional)
         sound_path = self.sound_path_edit.text().strip()
         if sound_path:
-            from pathlib import Path
             if not Path(sound_path).exists():
                 return False, "El archivo de sonido no existe"
         return True, ""
@@ -583,7 +579,6 @@ class AudioConfigTab(QWidget):
     def _on_change(self):
         valid, error = self._validate()
         if not valid:
-            # Mostrar error en el slider o campo
             self.volume_slider.setToolTip(error)
             self.sound_path_edit.setToolTip(error)
             self.sound_path_edit.setStyleSheet("border: 1px solid #ef4444;")
@@ -660,21 +655,17 @@ class ActionButtons(QWidget):
         self.create_button.setEnabled(enabled)
 
 
-# ============================================================================
-# PESTAÑA: CLIPS RECIENTES
-# ============================================================================
-
 class RecentClipsTab(QWidget):
     """
     Pestaña que muestra los clips recientemente guardados.
     Permite abrir la carpeta que contiene el clip y ver detalles.
     """
-    refresh_requested = pyqtSignal()  # Señal para pedir actualización de la lista
+    refresh_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setup_ui()
-        self.clips_data = []  # Almacenar los datos para poder abrir carpetas
+        self.clips_data = []
 
     def setup_ui(self):
         layout = QVBoxLayout()
@@ -722,7 +713,6 @@ class RecentClipsTab(QWidget):
             date = clip.get('date', '')
             modified = clip.get('modified', 0)
 
-            # Formatear fecha legible
             from datetime import datetime
             if modified:
                 date_str = datetime.fromtimestamp(modified).strftime("%Y-%m-%d %H:%M")
@@ -731,7 +721,6 @@ class RecentClipsTab(QWidget):
 
             text = f"{name}  |  {size:.1f} MB  |  {date_str}"
             item = QListWidgetItem(text)
-            # Guardar la ruta completa como data del item
             item.setData(Qt.ItemDataRole.UserRole, clip.get('path', ''))
             self.clip_list.addItem(item)
 
@@ -739,7 +728,6 @@ class RecentClipsTab(QWidget):
             self.clip_list.setCurrentRow(0)
 
     def _on_item_double_clicked(self, item):
-        """Abrir el clip cuando se hace doble clic (abrir con el programa asociado)."""
         path = item.data(Qt.ItemDataRole.UserRole)
         if path and Path(path).exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
@@ -747,12 +735,10 @@ class RecentClipsTab(QWidget):
             QMessageBox.warning(self, "No se puede abrir", "El archivo ya no existe o la ruta no es válida.")
 
     def _open_selected_folder(self):
-        """Abrir la carpeta que contiene el clip seleccionado."""
         current_item = self.clip_list.currentItem()
         if not current_item:
             QMessageBox.information(self, "Ningún clip seleccionado", "Selecciona un clip de la lista.")
             return
-
         path = current_item.data(Qt.ItemDataRole.UserRole)
         if path and Path(path).exists():
             folder = str(Path(path).parent)

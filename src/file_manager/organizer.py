@@ -1,11 +1,13 @@
 """
 Organizador de archivos de clips.
 Mueve los clips guardados por OBS a la estructura de carpetas configurada.
+Con caché thread-safe y manejo robusto de archivos.
 """
 
 import os
 import shutil
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -36,16 +38,17 @@ class FileOrganizer(QObject):
 
         self._observer = None
         self._file_handler = None
-        self._clip_counter = 0
         self._processed_files = set()
 
         # Contador de sesión para el token {counter}
         self._session_counter = 0
+        self._counter_lock = threading.Lock()
 
-        # Caché de clips recientes
+        # Caché de clips recientes (protegida con lock)
         self._recent_clips_cache = []
         self._recent_clips_cache_time = 0
         self._recent_clips_cache_ttl = 5.0  # segundos
+        self._cache_lock = threading.RLock()
 
         # Verificar permisos y crear directorio
         self._ensure_output_directory()
@@ -55,10 +58,6 @@ class FileOrganizer(QObject):
     def update_config(self, output_path: Optional[str] = None, naming_template: Optional[str] = None):
         """
         Actualizar configuración en caliente.
-
-        Args:
-            output_path: Nueva ruta de salida (opcional)
-            naming_template: Nueva plantilla de nombres (opcional)
         """
         changes = []
 
@@ -83,25 +82,21 @@ class FileOrganizer(QObject):
             ulog.info("FileOrganizer", "update_config", f"Plantilla de nombres actualizada a {naming_template}")
 
         if changes:
-            # Actualizar la configuración original (opcional)
             if hasattr(self.config, 'output_path') and output_path:
                 self.config.output_path = str(self.output_path)
             if hasattr(self.config, 'naming_template') and naming_template:
                 self.config.naming_template = naming_template
+            # Invalidar caché porque la ruta de salida cambió
+            self._invalidate_recent_cache()
 
     def _ensure_output_directory(self):
         """Asegurar que existe el directorio de salida con permisos."""
         try:
-            # Crear directorio si no existe
             self.output_path.mkdir(parents=True, exist_ok=True)
-
-            # Verificar permisos de escritura
             test_file = self.output_path / ".write_test"
             test_file.touch()
             test_file.unlink()
-
             ulog.info("FileOrganizer", "ensure_output_directory", f"Directorio verificado: {self.output_path}")
-
         except PermissionError as e:
             ulog.error("FileOrganizer", "ensure_output_directory", f"Permiso denegado para {self.output_path}: {e}")
             # Fallback a directorio temporal
@@ -110,22 +105,17 @@ class FileOrganizer(QObject):
             self.output_path = fallback_path
             ulog.info("FileOrganizer", "ensure_output_directory", f"Usando directorio fallback: {fallback_path}")
             raise
-
         except Exception as e:
             ulog.error("FileOrganizer", "ensure_output_directory", f"Error configurando directorio: {e}")
             raise
 
     def _get_clip_info(self) -> Dict[str, Any]:
-        """
-        Obtener información para el nombre del clip.
-        Incluye todos los tokens soportados.
-        """
+        """Obtener información para el nombre del clip."""
         now = datetime.now()
+        with self._counter_lock:
+            self._session_counter += 1
+            session_counter = self._session_counter
 
-        # Incrementar contador de sesión para el token {counter}
-        self._session_counter += 1
-
-        # Obtener contador por día (para posible uso futuro, aunque no se usa directamente en tokens)
         date_str = now.strftime("%Y-%m-%d")
         today_dir = self.output_path / date_str
         if today_dir.exists():
@@ -135,20 +125,17 @@ class FileOrganizer(QObject):
             daily_counter = 1
 
         return {
-            # Fecha y hora completas
-            'date': date_str,  # YYYY-MM-DD
-            'time': now.strftime("%H-%M-%S"),  # HH-MM-SS
+            'date': date_str,
+            'time': now.strftime("%H-%M-%S"),
             'datetime': now.strftime("%Y-%m-%d_%H-%M-%S"),
-            # Componentes individuales
             'year': now.strftime("%Y"),
             'month': now.strftime("%m"),
             'day': now.strftime("%d"),
             'hour': now.strftime("%H"),
             'minute': now.strftime("%M"),
             'second': now.strftime("%S"),
-            # Contadores
-            'counter': self._session_counter,      # Contador por sesión (se incrementa cada clip)
-            'daily_counter': daily_counter,        # Contador por día (no se usa en tokens pero puede ser útil)
+            'counter': session_counter,
+            'daily_counter': daily_counter,
             'timestamp': int(now.timestamp()),
         }
 
@@ -156,21 +143,15 @@ class FileOrganizer(QObject):
         """Generar nombre de archivo según plantilla."""
         try:
             filename = self.naming_template.format(**clip_info)
-
-            # Asegurar extensión
             if not filename.lower().endswith(extension.lower()):
                 filename += extension
-
             # Reemplazar caracteres inválidos
             invalid_chars = ['<', '>', ':', '"', '|', '?', '*', '\\', '/']
             for char in invalid_chars:
                 filename = filename.replace(char, '_')
-
             return filename
-
         except Exception as e:
-            ulog.error("FileOrganizer", "_generate_filename", f"Error generando nombre: {e}")
-            # Nombre por defecto
+            ulog.error("FileOrganizer", "_generate_filename", f"Error: {e}")
             return f"{clip_info['datetime']}_{clip_info['counter']}{extension}"
 
     def _create_daily_folder(self, date_str: str) -> Path:
@@ -180,62 +161,39 @@ class FileOrganizer(QObject):
         return daily_folder
 
     def _wait_for_file_ready(self, filepath: str, timeout: float = 10.0) -> bool:
-        """
-        Esperar a que un archivo esté listo para leer/escribir.
-
-        Args:
-            filepath: Ruta del archivo
-            timeout: Tiempo máximo en segundos
-
-        Returns:
-            True si el archivo está listo
-        """
+        """Espera a que un archivo esté listo para leer (tamaño estable y accesible)."""
         path = Path(filepath)
         start_time = time.time()
-
         while time.time() - start_time < timeout:
             try:
-                # Verificar si el archivo existe
                 if not path.exists():
                     time.sleep(0.1)
                     continue
-
-                # Intentar abrir el archivo
+                # Intentar abrir en modo lectura
                 with open(filepath, 'rb') as f:
-                    # Intentar leer el final del archivo
                     f.seek(-1, 2)
-                    _ = f.read(1)
-
-                # Verificar tamaño estable
-                current_size = path.stat().st_size
-                time.sleep(0.1)  # Esperar un poco
-                new_size = path.stat().st_size
-
-                if current_size == new_size and current_size > 0:
+                    f.read(1)
+                size1 = path.stat().st_size
+                time.sleep(0.1)
+                size2 = path.stat().st_size
+                if size1 == size2 and size1 > 0:
                     return True
-
             except (IOError, OSError, PermissionError):
                 time.sleep(0.1)
                 continue
             except Exception:
                 time.sleep(0.1)
                 continue
-
         return False
 
     def _ensure_unique_filename(self, filepath: Path) -> Path:
-        """
-        Asegurar nombre de archivo único.
-        Si el archivo ya existe, añade _1, _2, etc.
-        """
+        """Asegurar nombre de archivo único añadiendo _1, _2, etc. si ya existe."""
         if not filepath.exists():
             return filepath
-
         counter = 1
         base = filepath.stem
         suffix = filepath.suffix
         parent = filepath.parent
-
         while True:
             new_name = f"{base}_{counter}{suffix}"
             new_path = parent / new_name
@@ -246,12 +204,6 @@ class FileOrganizer(QObject):
     def organize_clip(self, source_path: str) -> Optional[Dict[str, Any]]:
         """
         Organizar un clip moviéndolo a la ubicación final.
-
-        Args:
-            source_path: Ruta del clip original (donde OBS lo guardó)
-
-        Returns:
-            Información del clip organizado o None si hay error.
         """
         source = Path(source_path)
         if not source.exists():
@@ -259,55 +211,31 @@ class FileOrganizer(QObject):
             return None
 
         try:
-            # Esperar a que el archivo esté completamente escrito (por si acaso)
+            # Esperar a que el archivo esté completo
             if not self._wait_for_file_ready(str(source), timeout=10):
                 ulog.warning("FileOrganizer", "organize_clip", f"Timeout esperando archivo: {source_path}")
 
-            # Obtener información para el nombre
             clip_info = self._get_clip_info()
-
-            # Crear carpeta del día
             daily_folder = self._create_daily_folder(clip_info['date'])
-
-            # Determinar extensión
-            source_ext = source.suffix.lower()
-            if not source_ext:
-                source_ext = ".mp4"
-
-            # Generar nombre final
+            source_ext = source.suffix.lower() or ".mp4"
             filename = self._generate_filename(clip_info, source_ext)
             destination_path = daily_folder / filename
-
-            # Evitar colisiones
             destination_path = self._ensure_unique_filename(destination_path)
 
-            ulog.info("FileOrganizer", "organize_clip",
-                      f"Moviendo {source} -> {destination_path}")
+            ulog.info("FileOrganizer", "organize_clip", f"Moviendo {source} -> {destination_path}")
 
-            # Si la ruta de origen ya está en la carpeta de destino, no mover (solo renombrar si es necesario)
             if source.parent == destination_path.parent:
-                # Está en la misma carpeta, solo renombrar si el nombre cambió
                 if source.name != destination_path.name:
-                    ulog.info("FileOrganizer", "organize_clip",
-                              f"Renombrando: {source.name} -> {destination_path.name}")
                     source.rename(destination_path)
-                else:
-                    ulog.info("FileOrganizer", "organize_clip",
-                              f"Archivo ya está en lugar correcto: {destination_path}")
             else:
-                # Mover archivo
                 shutil.move(str(source), str(destination_path))
 
-            # Verificar que se movió correctamente
             if not destination_path.exists():
-                ulog.error("FileOrganizer", "organize_clip", f"Error moviendo archivo a {destination_path}")
-                return None
+                raise IOError(f"No se pudo mover el archivo a {destination_path}")
 
-            # Obtener información adicional
             file_size = destination_path.stat().st_size
             file_mtime = destination_path.stat().st_mtime
 
-            # Actualizar información del clip
             clip_info.update({
                 'source_path': source_path,
                 'destination_path': str(destination_path),
@@ -319,72 +247,48 @@ class FileOrganizer(QObject):
                 'success': True
             })
 
-            # Emitir señal
             self.clip_saved.emit(clip_info)
-
-            # Invalidar caché de clips recientes (para que se actualice en la próxima consulta)
             self._invalidate_recent_cache()
 
-            ulog.info("FileOrganizer", "organize_clip",
-                      f"Clip organizado: {destination_path.name} ({clip_info['size_mb']:.2f} MB)")
-
+            ulog.info("FileOrganizer", "organize_clip", f"Clip organizado: {destination_path.name} ({clip_info['size_mb']:.2f} MB)")
             return clip_info
 
         except PermissionError as e:
-            error_info = {
-                'source_path': source_path,
-                'error': f"Permiso denegado: {str(e)}",
-                'timestamp': time.time()
-            }
+            error_info = {'source_path': source_path, 'error': f"Permiso denegado: {e}", 'timestamp': time.time()}
             ulog.error("FileOrganizer", "organize_clip", f"Error de permisos: {e}")
             self.clip_error.emit(error_info)
             return None
-
         except Exception as e:
-            error_info = {
-                'source_path': source_path,
-                'error': str(e),
-                'timestamp': time.time()
-            }
+            error_info = {'source_path': source_path, 'error': str(e), 'timestamp': time.time()}
             ulog.error("FileOrganizer", "organize_clip", f"Error organizando clip: {e}")
             self.clip_error.emit(error_info)
             return None
 
     def _invalidate_recent_cache(self):
-        """Invalidar la caché de clips recientes."""
-        self._recent_clips_cache = []
-        self._recent_clips_cache_time = 0
+        """Invalidar la caché de clips recientes (thread-safe)."""
+        with self._cache_lock:
+            self._recent_clips_cache = []
+            self._recent_clips_cache_time = 0
 
     def get_recent_clips(self, limit: int = 10) -> List[Dict[str, Any]]:
         """
-        Obtener lista de clips recientes con caché.
-
-        Args:
-            limit: Número máximo de clips a devolver
-
-        Returns:
-            Lista de diccionarios con información de los clips.
+        Obtener lista de clips recientes con caché thread-safe.
         """
-        # Si la caché es válida, devolverla
         current_time = time.time()
-        if (self._recent_clips_cache and
-            (current_time - self._recent_clips_cache_time) < self._recent_clips_cache_ttl):
-            return self._recent_clips_cache[:limit]
+        with self._cache_lock:
+            if self._recent_clips_cache and (current_time - self._recent_clips_cache_time) < self._recent_clips_cache_ttl:
+                return self._recent_clips_cache[:limit]
 
-        # Si no, reconstruir caché
+        # Reconstruir caché (sin mantener el lock mientras se escanea el disco)
         clips = []
-
         try:
-            # Recorrer carpetas por fecha (más recientes primero)
             date_folders = sorted(
                 [d for d in self.output_path.iterdir() if d.is_dir() and d.name.count('-') == 2],
                 key=lambda x: x.name,
                 reverse=True
             )
-
+            video_extensions = ['.mp4', '.mkv', '.mov', '.avi', '.flv']
             for date_folder in date_folders:
-                # Buscar archivos de video
-                video_extensions = ['.mp4', '.mkv', '.mov', '.avi', '.flv']
                 for ext in video_extensions:
                     for clip_file in sorted(date_folder.glob(f"*{ext}"), key=lambda x: x.stat().st_mtime, reverse=True):
                         stat = clip_file.stat()
@@ -397,30 +301,26 @@ class FileOrganizer(QObject):
                             'modified': stat.st_mtime,
                             'created': stat.st_ctime
                         })
-
                         if len(clips) >= limit:
                             break
                     if len(clips) >= limit:
                         break
                 if len(clips) >= limit:
                     break
+        except Exception as e:
+            ulog.error("FileOrganizer", "get_recent_clips", f"Error escaneando clips: {e}")
+            return []
 
-            # Guardar en caché
+        with self._cache_lock:
             self._recent_clips_cache = clips
             self._recent_clips_cache_time = current_time
-
-            return clips[:limit]
-
-        except Exception as e:
-            ulog.error("FileOrganizer", "get_recent_clips", f"Error obteniendo clips: {e}")
-            return []
+        return clips[:limit]
 
     def cleanup_old_clips(self, days_to_keep: int = 30):
         """Eliminar clips más antiguos que days_to_keep días."""
         try:
             cutoff_time = time.time() - (days_to_keep * 24 * 3600)
             deleted_count = 0
-
             for date_folder in self.output_path.iterdir():
                 if date_folder.is_dir() and date_folder.name.count('-') == 2:
                     try:
@@ -431,12 +331,9 @@ class FileOrganizer(QObject):
                             deleted_count += 1
                     except ValueError:
                         continue
-
             if deleted_count > 0:
                 ulog.info("FileOrganizer", "cleanup_old_clips", f"Eliminadas {deleted_count} carpetas antiguas")
-                # Invalidar caché porque los clips eliminados ya no están
                 self._invalidate_recent_cache()
-
         except Exception as e:
             ulog.error("FileOrganizer", "cleanup_old_clips", f"Error limpiando clips: {e}")
 
@@ -445,14 +342,12 @@ class FileOrganizer(QObject):
         try:
             total_size = 0
             total_files = 0
-
             for date_folder in self.output_path.iterdir():
                 if date_folder.is_dir():
                     for video_file in date_folder.glob("*.*"):
                         if video_file.suffix.lower() in ['.mp4', '.mkv', '.mov', '.avi', '.flv']:
                             total_size += video_file.stat().st_size
                             total_files += 1
-
             return {
                 'total_clips': total_files,
                 'total_size_bytes': total_size,
@@ -460,9 +355,8 @@ class FileOrganizer(QObject):
                 'total_size_gb': total_size / (1024 * 1024 * 1024),
                 'output_path': str(self.output_path)
             }
-
         except Exception as e:
-            ulog.error("FileOrganizer", "get_storage_info", f"Error obteniendo info: {e}")
+            ulog.error("FileOrganizer", "get_storage_info", f"Error: {e}")
             return {
                 'total_clips': 0,
                 'total_size_bytes': 0,

@@ -75,7 +75,6 @@ class HotkeyManager:
         self._char_map = {chr(i): pynput_kb.KeyCode.from_char(chr(i)) for i in range(32, 127)}
 
         self._target_combo: Optional[Set[pynput_kb.Key]] = None
-        self._target_modifiers: Set[pynput_kb.Key] = set()
 
         # Mapeo de modificadores para comprobación rápida
         self._modifier_keys = {
@@ -90,26 +89,17 @@ class HotkeyManager:
         key_name = key_name.lower()
         if key_name in self._key_map:
             return self._key_map[key_name]
-        # Tecla alfanumérica
         if len(key_name) == 1 and key_name in self._char_map:
             return self._char_map[key_name]
-        # Tecla numérica
         if key_name.isdigit() and key_name in self._char_map:
             return self._char_map[key_name]
-        # Si no se encuentra, lanzar error
         raise ValueError(f"Tecla no soportada: {key_name}")
 
     def normalize_hotkey(self, hotkey: str) -> str:
-        """
-        Normalizar formato de hotkey
-        """
+        """Normalizar formato de hotkey."""
         if not hotkey:
             return ""
-
-        # Convertir a minúsculas
         normalized = hotkey.lower()
-
-        # Reemplazar variantes comunes
         replacements = {
             'control': 'ctrl',
             'windows': 'win',
@@ -118,58 +108,39 @@ class HotkeyManager:
         }
         for old, new in replacements.items():
             normalized = normalized.replace(old, new)
-
-        # Eliminar espacios y estandarizar separadores
         normalized = normalized.replace(' ', '').replace('++', '+')
-
-        # Eliminar duplicados
         parts = normalized.split('+')
         unique_parts = []
         for part in parts:
             if part and part not in unique_parts:
                 unique_parts.append(part)
-
         return '+'.join(unique_parts)
 
     def validate_hotkey(self, hotkey: str) -> tuple[bool, str]:
-        """
-        Validar que la hotkey sea válida
-        """
+        """Validar que la hotkey sea válida."""
         if not hotkey:
             return False, "Hotkey no puede estar vacía"
-
         normalized = self.normalize_hotkey(hotkey)
         parts = normalized.split('+')
-
-        # Validar que haya al menos una tecla regular
         modifiers = ['ctrl', 'shift', 'alt', 'win', 'cmd']
         regular_keys = [p for p in parts if p not in modifiers]
-
         if not regular_keys:
             return False, "Debe incluir al menos una tecla regular (no modificadora)"
-
         if len(regular_keys) > 1:
             return False, "Solo puede tener una tecla regular"
-
-        # Verificar que cada parte sea una tecla conocida
         try:
             for part in parts:
                 self._get_key_object(part)
         except ValueError as e:
             return False, str(e)
-
         return True, ""
 
     def _parse_combo(self, normalized: str) -> Tuple[Set[pynput_kb.Key], Set[pynput_kb.Key]]:
-        """
-        Parsea una hotkey normalizada en un conjunto de teclas requeridas.
-        Retorna (required_keys, modifiers) donde modifiers es un subconjunto.
-        """
+        """Parsea una hotkey normalizada en un conjunto de teclas requeridas."""
         parts = normalized.split('+')
         modifiers = {'ctrl', 'shift', 'alt', 'win', 'cmd'}
         required = set()
         mod_set = set()
-
         for part in parts:
             key = self._get_key_object(part)
             required.add(key)
@@ -186,16 +157,13 @@ class HotkeyManager:
     def _on_release(self, key):
         """Callback cuando se suelta una tecla."""
         with self._lock:
-            if key in self.current_pressed:
-                self.current_pressed.remove(key)
+            self.current_pressed.discard(key)
 
     def _check_match(self):
         """Verifica si la combinación actual coincide con la registrada."""
         if not self.is_registered or not self.callback or not self._target_combo:
             return
-
-        # Para que coincida, el conjunto de teclas presionadas debe contener exactamente
-        # las teclas requeridas (sin teclas extra).
+        # La combinación debe coincidir exactamente (sin teclas extra)
         if self.current_pressed == self._target_combo:
             # Invocar callback en un hilo separado para no bloquear el listener
             threading.Thread(
@@ -216,24 +184,18 @@ class HotkeyManager:
         return wrapper
 
     def register(self, hotkey: str, callback: Callable) -> bool:
-        """
-        Registrar una hotkey global de forma segura.
-        """
+        """Registrar una hotkey global de forma segura."""
         with self._lock:
-            # Limpiar registro anterior
             if self.is_registered:
                 self.unregister()
 
             try:
-                # Normalizar y validar
                 normalized = self.normalize_hotkey(hotkey)
                 is_valid, error_msg = self.validate_hotkey(normalized)
-
                 if not is_valid:
                     ulog.error("HotkeyManager", "register", f"Hotkey inválida: {error_msg}")
                     return False
 
-                # Parsear combinación
                 required_keys, _ = self._parse_combo(normalized)
 
                 # Iniciar el listener si no está corriendo
@@ -242,17 +204,16 @@ class HotkeyManager:
                         on_press=self._on_press,
                         on_release=self._on_release
                     )
-                    self.listener.daemon = True  # Para que termine con el programa
+                    self.listener.daemon = True
                     self.listener_thread = threading.Thread(target=self.listener.start, daemon=True)
                     self.listener_thread.start()
-                    # Esperar un poco para asegurar que arrancó
-                    time.sleep(0.1)
+                    time.sleep(0.1)  # Pequeña pausa para asegurar inicio
 
                 self.registered_hotkey = normalized
                 self.callback = callback
                 self.is_registered = True
                 self._target_combo = required_keys
-                self.current_pressed.clear()  # Limpiar estado por si acaso
+                self.current_pressed.clear()
 
                 ulog.info("HotkeyManager", "register", f"✅ Hotkey registrada: {normalized}")
                 return True
@@ -262,13 +223,10 @@ class HotkeyManager:
                 return False
 
     def unregister(self) -> bool:
-        """
-        Desregistrar la hotkey actual.
-        """
+        """Desregistrar la hotkey actual."""
         with self._lock:
             if not self.is_registered:
                 return True
-
             try:
                 self.registered_hotkey = None
                 self.callback = None
@@ -282,17 +240,15 @@ class HotkeyManager:
                 return False
 
     def cleanup(self):
-        """
-        Limpieza completa al cerrar la aplicación.
-        Detiene el listener si estaba activo.
-        """
+        """Limpieza completa al cerrar la aplicación. Detiene el listener."""
         self.unregister()
         try:
             if self.listener and self.listener.running:
                 self.listener.stop()
                 if self.listener_thread and self.listener_thread.is_alive():
-                    self.listener_thread.join(timeout=1.0)
+                    self.listener_thread.join(timeout=2.0)
             self.listener = None
+            self.listener_thread = None
             ulog.info("HotkeyManager", "cleanup", "✅ Hotkey listener detenido")
         except Exception as e:
             ulog.error("HotkeyManager", "cleanup", f"Error deteniendo listener: {e}")
